@@ -41,6 +41,9 @@ YukiCrypt is a personal encrypted file vault — it stores any files you want (d
 | Dark Theme | Light Theme |
 |---|---|
 | *(dark terminal aesthetic)* | *(clean light mode)* |
+| ![Screenshot 2026-04-09 002043](https://github.com/user-attachments/assets/1a842249-5fdd-42fc-8d76-5299f3c5fc53) | ![Screenshot 2026-04-09 002101](https://github.com/user-attachments/assets/0f700ed5-c639-4d42-bca3-18314f747fb1) |
+
+
 
 ---
 
