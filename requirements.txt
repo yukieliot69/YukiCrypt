@@ -1,0 +1,7 @@
+# Required
+PyQt6>=6.4.0
+cryptography>=41.0.0
+
+# Recommended — stronger key derivation (Argon2id vs PBKDF2)
+# If not installed, YukiCrypt falls back to PBKDF2-SHA512 with 600k iterations
+argon2-cffi>=21.3.0
