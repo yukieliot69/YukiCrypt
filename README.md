@@ -40,6 +40,14 @@ YukiCrypt is a personal encrypted file vault — store any files you want (docum
 
 ---
 
+## Screenshots
+
+| Dark Theme | Light Theme |
+|---|---|
+| ![Dark Theme](yukicrypt-dark.jpg) | ![Light Theme](yukicrypt-light.jpg) |
+
+---
+
 ## Quick Start
 
 ```bash
