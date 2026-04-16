@@ -535,6 +535,22 @@ class ExportWorker(QThread):
         self.finished.emit(ok, fail, self.dest)
 
 
+class CompactWorker(QThread):
+    finished = pyqtSignal(bool, str)   # success, message
+
+    def __init__(self, vault: Vault):
+        super().__init__()
+        self.vault = vault
+
+    def run(self):
+        try:
+            before, after = self.vault.compact()
+            saved = before - after
+            self.finished.emit(True, f"{saved}")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
 class BackupWorker(QThread):
     finished = pyqtSignal(bool, str)   # success, message/path
 
@@ -545,8 +561,10 @@ class BackupWorker(QThread):
 
     def run(self):
         try:
-            self.vault.backup(self.backup_path)
-            self.finished.emit(True, self.backup_path)
+            original_size, backup_size = self.vault.backup(self.backup_path)
+            saved = original_size - backup_size
+            # Pass path and size info as "path|saved_bytes"
+            self.finished.emit(True, f"{self.backup_path}|{saved}")
         except Exception as e:
             self.finished.emit(False, str(e))
 
@@ -974,6 +992,7 @@ class VaultView(QWidget):
         tb.addSeparator()
         tb_action("✓  CHECK",         self._check_integrity)
         tb_action("⊞  BACKUP",        self._backup_vault)
+        tb_action("▼  COMPACT",       self._compact_vault)
         tb_action("⚕  RECOVER",       self._recover_vault)
         tb.addSeparator()
         tb_action("🔒  LOCK VAULT",   self.lock_requested.emit)
@@ -1427,15 +1446,74 @@ class VaultView(QWidget):
     def _backup_done(self, success: bool, msg: str):
         self._set_busy(False)
         if success:
-            self.status_cb(f"Backup saved: {Path(msg).name}")
+            parts     = msg.split("|")
+            path      = parts[0]
+            saved     = int(parts[1]) if len(parts) > 1 else 0
+            size_info = f"\nSpace saved vs original: {fmt_size(saved)}" if saved > 0 else ""
+            self.status_cb(f"Backup saved: {Path(path).name}")
             QMessageBox.information(
                 self, "Backup Complete",
-                f"Vault backed up successfully to:\n{msg}\n\n"
-                "This backup is encrypted with your same password."
+                f"Vault backed up to:\n{path}\n"
+                f"Backup is already compact — no wasted space.{size_info}\n\n"
+                "Encrypted with your same password."
             )
         else:
             self.status_cb("Backup failed.")
             QMessageBox.critical(self, "Backup Failed", f"Error:\n{msg}")
+
+    # ── Compact ──────────────────────────────────────────────────────────
+
+    def _compact_vault(self):
+        """Run VACUUM to reclaim space freed by deleted files."""
+        stats = self.vault.vault_stats()
+        db_size = stats["db_size"]
+
+        reply = QMessageBox.question(
+            self, "Compact Vault",
+            f"Current vault size: {fmt_size(db_size)}\n\n"
+            "This will rebuild the vault file and reclaim space from deleted files.\n"
+            "The vault stays encrypted throughout.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._set_busy(True)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)   # indeterminate — VACUUM duration varies
+        self.status_cb("Compacting vault...")
+
+        cworker = CompactWorker(self.vault)
+        self._active_workers.append(cworker)
+        cworker.finished.connect(self._compact_done)
+        cworker.finished.connect(
+            lambda: self._active_workers.remove(cworker)
+            if cworker in self._active_workers else None
+        )
+        cworker.start()
+
+    def _compact_done(self, success: bool, msg: str):
+        self.progress.setVisible(False)
+        self._set_busy(False)
+        self._refresh()
+        if success:
+            saved = int(msg)
+            if saved > 0:
+                QMessageBox.information(
+                    self, "Compact Complete",
+                    f"Vault compacted successfully.\n\nSpace reclaimed: {fmt_size(saved)}"
+                )
+                self.status_cb(f"Compacted — saved {fmt_size(saved)}.")
+            else:
+                QMessageBox.information(
+                    self, "Compact Complete",
+                    "Vault is already compact — no free space to reclaim."
+                )
+                self.status_cb("Vault already compact.")
+        else:
+            QMessageBox.critical(self, "Compact Failed", f"Error:\n{msg}")
+            self.status_cb("Compact failed.")
 
     # ── Recovery ─────────────────────────────────────────────────────────
 
