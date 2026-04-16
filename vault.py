@@ -566,15 +566,66 @@ class Vault:
 
         return {"recovered": recovered, "failed": failed}
 
-    def backup(self, backup_path: str):
-        """Atomic backup using SQLite's backup API — safe even during writes."""
+    def compact(self):
+        """
+        Reclaim free space using VACUUM INTO.
+        WAL mode prevents in-place VACUUM from shrinking the file, so we use
+        VACUUM INTO to create a compact copy then atomically replace the original.
+        Returns (size_before, size_after) in bytes.
+        """
         with self._lock:
-            dest = sqlite3.connect(backup_path, check_same_thread=False)
+            if not self._path:
+                return 0, 0
+
+            size_before  = os.path.getsize(self._path)
+            tmp_path     = self._path + ".compact_tmp"
+
             try:
-                self._db.backup(dest)
-            finally:
-                dest.close()
-        log.info(f"Backup created: {backup_path}")
+                # VACUUM INTO works with WAL mode — creates compacted copy
+                self._db.execute(f'VACUUM INTO "{tmp_path}"')
+
+                size_after = os.path.getsize(tmp_path)
+
+                # Only replace if we actually saved space
+                if size_after < size_before:
+                    self._db.close()
+                    os.replace(tmp_path, self._path)
+                    # Re-open the compacted file
+                    self._db = sqlite3.connect(
+                        self._path, check_same_thread=False
+                    )
+                    self._db.execute("PRAGMA journal_mode=WAL")
+                    self._db.execute("PRAGMA synchronous=FULL")
+                else:
+                    os.remove(tmp_path)
+                    size_after = size_before
+
+            except Exception:
+                # Clean up temp file if anything went wrong
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise
+
+        log.info(f"Compacted: {size_before:,} → {size_after:,} bytes")
+        return size_before, size_after
+
+    def backup(self, backup_path: str):
+        """
+        Create a compact backup using VACUUM INTO.
+        Unlike the SQLite backup API, VACUUM INTO copies only live data pages
+        so the backup is already compact — free space from deleted files is
+        not copied. Atomic: backup is either complete or not written at all.
+        Returns (original_size, backup_size) in bytes.
+        """
+        with self._lock:
+            original_size = os.path.getsize(self._path) if self._path else 0
+            self._db.execute(f'VACUUM INTO "{backup_path}"')
+            backup_size = os.path.getsize(backup_path)
+        log.info(f"Backup created: {backup_path} ({backup_size:,} bytes)")
+        return original_size, backup_size
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
