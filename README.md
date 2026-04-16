@@ -18,7 +18,8 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square)](https://python.org)
 [![PyQt6](https://img.shields.io/badge/UI-PyQt6-green?style=flat-square)](https://pypi.org/project/PyQt6/)
-[![Encryption](https://img.shields.io/badge/Encryption-AES--256--GCM-brightgreen?style=flat-square)](#security)
+[![Encryption](https://img.shields.io/badge/Encryption-AES--256--GCM-brightgreen?style=flat-square)](#security-properties)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)](#quick-start)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 
 </div>
@@ -27,23 +28,15 @@
 
 ## What is YukiCrypt?
 
-YukiCrypt is a personal encrypted file vault — it stores any files you want (documents, photos, videos, wallets, anything) inside a single encrypted `.ykc` file that looks like random data to anyone without your password.
+YukiCrypt is a personal encrypted file vault — store any files you want (documents, photos, videos, wallets, anything) inside a single encrypted `.ykc` file that looks like random data to anyone without your password.
 
-- **No drivers** — works on any Windows machine, no installation needed
+- **No drivers** — works on any machine, no installation needed
 - **No admin rights** — runs as a normal user
 - **No cloud** — your data stays on your machine or USB drive
 - **One file** — your entire vault is a single `.ykc` file, easy to back up or move
+- **Cross-platform** — runs on Windows, macOS, and Linux
 
----
-
-## Screenshots
-
-| Dark Theme | Light Theme |
-|---|---|
-| *(dark terminal aesthetic)* | *(clean light mode)* |
-| ![Screenshot 2026-04-09 002043](https://github.com/user-attachments/assets/1a842249-5fdd-42fc-8d76-5299f3c5fc53) | ![Screenshot 2026-04-09 002101](https://github.com/user-attachments/assets/0f700ed5-c639-4d42-bca3-18314f747fb1) |
-
-
+> ⚠️ The pre-built `.exe` may be flagged by antivirus as a false positive — this is a known issue with all Python apps built with PyInstaller. The full source code is available to review. If you're concerned, run directly from source.
 
 ---
 
@@ -51,10 +44,7 @@ YukiCrypt is a personal encrypted file vault — it stores any files you want (d
 
 ```bash
 # Install dependencies
-pip install PyQt6 cryptography
-
-# Optional but recommended — stronger key derivation
-pip install argon2-cffi
+pip install PyQt6 cryptography argon2-cffi
 
 # Run
 python app.py
@@ -69,9 +59,10 @@ That's it. No drivers. No VeraCrypt. No Microsoft permissions.
 ### File Management
 - Browse files in a folder tree — works like Windows Explorer
 - Drag & drop files and folders directly into the vault
-- Double-click any file to open it in the right app (Word, VLC, etc.)
-- Files are automatically re-encrypted when you save and close them
-- Full subfolder support — preserves original folder structure
+- Preserves original folder structure including empty folders
+- Double-click any file to open it in the right app (Word, VLC, browser, etc.)
+- Files automatically re-encrypted when you save and close them
+- Export selected files back to disk while preserving folder structure
 
 ### Security
 - **AES-256-GCM** encryption — same algorithm used by Signal and WhatsApp
@@ -80,18 +71,21 @@ That's it. No drivers. No VeraCrypt. No Microsoft permissions.
 - **Authenticated encryption** — any tampering or corruption is instantly detected
 - **Temp files wiped** — 3-pass random overwrite before deletion
 - **Key zeroed on close** — encryption key cleared from memory when vault locks
+- **Atomic writes** — crash during save can never leave a file partially written
 
-### Vault Protection
-- **Integrity check** — scans every file's authentication tag, detects bit rot and tampering
-- **Atomic backup** — crash-safe backup using SQLite's built-in backup API
-- **Emergency recovery** — extracts all readable files even from a partially damaged vault
-- **Disk space check** — warns before importing if disk is nearly full
+### Vault Tools
+| Button | What it does |
+|---|---|
+| **✓ CHECK** | Scan every file's AES-GCM tag — detects bit rot and tampering |
+| **⊞ BACKUP** | Create a compact encrypted backup (uses `VACUUM INTO` — smaller than original) |
+| **▼ COMPACT** | Reclaim space freed by deleted files — shrinks the vault to actual used size |
+| **⚕ RECOVER** | Extract all readable files even from a partially damaged vault |
 
 ### UI
-- Dark and light themes, switchable instantly
-- Progress bar for all long operations (import, delete, backup, check)
-- Non-blocking — all heavy operations run in background threads
-- Keyboard shortcut: Enter to unlock
+- Dark and light themes, switchable instantly with the `☀/🌙` button
+- Progress bar for all long operations — UI never freezes
+- All heavy operations run in background threads
+- Disk space check before large imports
 
 ---
 
@@ -113,7 +107,7 @@ Your password
                          └── file path used as AAD (can't swap blobs)
 ```
 
-The vault file contains no plaintext — filenames, file contents, and folder structure are all encrypted. An attacker who steals the file sees only random bytes.
+The vault file contains no plaintext — filenames, file contents, and folder structure are all encrypted. An attacker who gets the file sees only random bytes.
 
 ---
 
@@ -123,15 +117,17 @@ The vault file contains no plaintext — filenames, file contents, and folder st
 |---|---|
 | Encryption | AES-256-GCM (authenticated) |
 | Key derivation | Argon2id — 64MB RAM, 3 passes, 4 threads |
+| Fallback KDF | PBKDF2-SHA512, 600,000 iterations |
 | Nonce | 96-bit cryptographically random, unique per file per write |
-| Path binding | File path used as GCM additional data — blobs can't be swapped |
+| Path binding | File path used as GCM AAD — encrypted blobs can't be swapped between paths |
 | Filenames | Also encrypted — vault reveals nothing about contents |
 | Temp files | 3-pass random overwrite before deletion |
 | Key in memory | Zeroed with `ctypes.memset` on vault lock/close |
 | Wrong password | Detected instantly via encrypted verification blob |
 | Tamper detection | GCM authentication tag catches any modification |
-| Crash safety | SQLite WAL mode + `PRAGMA synchronous=FULL` |
-| Duplicate writes | Old encrypted blob securely wiped before replacing |
+| Crash safety | SQLite WAL mode + `PRAGMA synchronous=FULL` + atomic transactions |
+| Write safety | DELETE + INSERT wrapped in explicit transaction — no partial writes |
+| Compact backup | `VACUUM INTO` — backup never contains deleted file data |
 
 ### Threat Model
 
@@ -139,26 +135,27 @@ The vault file contains no plaintext — filenames, file contents, and folder st
 - Stolen laptop or hard drive
 - Cloud storage provider snooping
 - Casual attackers and nosy people
-- Bit rot and silent data corruption
+- Bit rot and silent data corruption (detected by integrity check)
 
 ⚠️ **Partial protection:**
+- Files are decrypted to a temp folder while open — temp file exists on disk until you close the file
 - Live memory forensics (key is wiped on close, but Python GC is not fully controllable)
-- Sophisticated targeted malware on your running machine
+- Sophisticated targeted malware already running on your machine
 
 ❌ **Not designed for:**
-- Nation-state adversaries
-- Scenarios requiring plausible deniability (use VeraCrypt for that)
+- Nation-state adversaries with physical access to your running machine
+- Scenarios requiring plausible deniability — use VeraCrypt for that
 
 ---
 
-## File Structure
+## Vault Size & Compaction
 
-```
-yukicrypt/
-├── app.py       — GUI application (PyQt6)
-├── vault.py     — Encryption engine (AES-256-GCM, Argon2id, SQLite)
-└── README.md
-```
+SQLite does not shrink the vault file when files are deleted — it keeps free pages for future use. Use the tools provided to reclaim space:
+
+- **▼ COMPACT** — runs `VACUUM INTO` in place, vault shrinks immediately
+- **⊞ BACKUP** — the backup is always compact (only live data is copied)
+
+Example: a 300MB vault after deleting most files → compact brings it down to actual used size.
 
 ---
 
@@ -166,10 +163,15 @@ yukicrypt/
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name YukiCrypt app.py
+python -m PyInstaller --onefile --windowed --name YukiCrypt --hidden-import argon2 app.py
 ```
 
-Output: `dist/YukiCrypt.exe` — runs on any Windows machine, no Python needed.
+Output: `dist/YukiCrypt.exe` — runs on any Windows machine with no Python needed.
+
+**macOS / Linux:**
+```bash
+python -m PyInstaller --onefile --windowed --name YukiCrypt --hidden-import argon2 app.py
+```
 
 ---
 
@@ -180,9 +182,10 @@ Output: `dist/YukiCrypt.exe` — runs on any Windows machine, no Python needed.
 | Container | SQLite database (`.ykc`) |
 | Meta table | Salt, KDF info, encrypted verification blob |
 | Files table | `enc_path`, `path_nonce`, `enc_data`, `data_nonce`, `size`, `modified` |
-| Path index | In-memory dict for O(1) file lookup (rebuilt on open) |
+| Path index | In-memory dict for O(1) file lookup — rebuilt on open |
+| Transactions | All writes atomic — crash cannot corrupt existing files |
 
-All sensitive columns (`enc_path`, `enc_data`) are AES-256-GCM encrypted blobs. The SQLite structure itself reveals only the number of files stored, nothing else.
+All sensitive columns (`enc_path`, `enc_data`) are AES-256-GCM encrypted blobs. The SQLite structure reveals only the number of stored entries — nothing else.
 
 ---
 
@@ -192,11 +195,23 @@ All sensitive columns (`enc_path`, `enc_data`) are AES-256-GCM encrypted blobs. 
 |---|---|---|
 | `PyQt6` | GUI framework | ✅ Yes |
 | `cryptography` | AES-256-GCM, PBKDF2 | ✅ Yes |
-| `argon2-cffi` | Argon2id key derivation | ⭐ Recommended |
+| `argon2-cffi` | Argon2id key derivation (stronger) | ⭐ Recommended |
 
-Install:
 ```bash
 pip install PyQt6 cryptography argon2-cffi
+```
+
+---
+
+## File Structure
+
+```
+yukicrypt/
+├── app.py          — GUI application (PyQt6)
+├── vault.py        — Encryption engine (AES-256-GCM, Argon2id, SQLite)
+├── requirements.txt
+├── LICENSE
+└── SECURITY.md     — How to report vulnerabilities
 ```
 
 ---
@@ -208,5 +223,5 @@ MIT License — see [LICENSE](LICENSE) for details.
 ---
 
 <div align="center">
-Made with Python · AES-256-GCM · Argon2id
+Made with Python · AES-256-GCM · Argon2id · SQLite
 </div>
