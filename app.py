@@ -35,7 +35,10 @@ from PyQt6.QtGui import (
     QColor, QPalette, QDragEnterEvent, QDropEvent
 )
 
-from vault import Vault, VaultError, WrongPasswordError, TamperedError, analyse_password
+from vault import (
+    Vault, VaultError, WrongPasswordError, TamperedError,
+    analyse_password, safe_output_path
+)
 
 # Let the caller configure logging; default to no-op if not configured
 log = logging.getLogger(__name__)
@@ -519,13 +522,8 @@ class ExportWorker(QThread):
             self.progress.emit(i + 1, len(self.files))
             try:
                 data = self.vault.read_file(f["path"])
-                # Preserve subfolder structure to avoid name collisions
-                if f["folder"]:
-                    out_dir = os.path.join(self.dest, f["folder"].replace("/", os.sep))
-                    os.makedirs(out_dir, exist_ok=True)
-                    outpath = os.path.join(out_dir, f["name"])
-                else:
-                    outpath = os.path.join(self.dest, f["name"])
+                outpath = safe_output_path(self.dest, f["path"])
+                os.makedirs(os.path.dirname(outpath), exist_ok=True)
                 with open(outpath, "wb") as fh:
                     fh.write(data)
                 ok += 1
@@ -1213,7 +1211,7 @@ class VaultView(QWidget):
         except Exception:
             return
 
-        deadline  = time.time() + 1800   # 30 minute max watch window
+        vault     = self.vault
         self_ref  = weakref.ref(self)     # weak ref — won't prevent GC
 
         def _check():
@@ -1222,13 +1220,12 @@ class VaultView(QWidget):
                 # VaultView was destroyed — try to wipe temp file
                 try:
                     if os.path.exists(tmp_path):
-                        import os as _os
-                        _os.remove(tmp_path)
+                        vault.secure_delete_temp(tmp_path)
                 except Exception:
                     pass
                 return
             try:
-                if not os.path.exists(tmp_path) or time.time() > deadline:
+                if not os.path.exists(tmp_path):
                     view._open_map.pop(virtual_path, None)
                     return
                 mtime_after = os.path.getmtime(tmp_path)
@@ -1763,11 +1760,13 @@ class VaultView(QWidget):
             self._import_files(paths)
 
     def cleanup_temps(self):
-        """Wipe all open temp files and wait for workers — call on lock/close."""
-        # Wait up to 3s for any running workers to finish before closing vault
+        """Wipe open temp files. Returns False while background work is active."""
+        if self.has_active_workers():
+            return False
+
         for worker in list(self._active_workers):
             try:
-                worker.wait(3000)   # 3 second timeout
+                worker.wait()
             except Exception:
                 pass
         self._active_workers.clear()
@@ -1778,6 +1777,10 @@ class VaultView(QWidget):
             except Exception:
                 pass
         self._open_map.clear()
+        return True
+
+    def has_active_workers(self) -> bool:
+        return any(worker.isRunning() for worker in self._active_workers)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1882,7 +1885,9 @@ class MainWindow(QMainWindow):
     def _load_vault(self, vault: Vault, path: str):
         # Remove old vault view if any
         if self._vault_view:
-            self._vault_view.cleanup_temps()
+            if not self._vault_view.cleanup_temps():
+                vault.close()
+                raise VaultError("Wait for the current vault operation to finish first.")
             self.stack.removeWidget(self._vault_view)
             self._vault_view.deleteLater()
             self._vault_view = None
@@ -1903,7 +1908,12 @@ class MainWindow(QMainWindow):
 
     def _lock(self):
         if self._vault_view:
-            self._vault_view.cleanup_temps()
+            if not self._vault_view.cleanup_temps():
+                QMessageBox.information(
+                    self, "Please Wait",
+                    "Wait for the current vault operation to finish before locking."
+                )
+                return
         if self._vault:
             self._vault.close()
             self._vault = None
@@ -1919,7 +1929,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self._vault_view:
-            self._vault_view.cleanup_temps()
+            if not self._vault_view.cleanup_temps():
+                QMessageBox.information(
+                    self, "Please Wait",
+                    "Wait for the current vault operation to finish before closing."
+                )
+                event.ignore()
+                return
         if self._vault:
             self._vault.close()
         event.accept()
