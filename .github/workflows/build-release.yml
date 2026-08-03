@@ -1,8 +1,31 @@
 name: Build and Release
 
 on:
+  # Triggered automatically when a new release is published via the GitHub UI or API
   release:
     types: [published]
+
+  # Triggered manually: go to Actions → "Build and Release" → Run workflow
+  # This will create the tag, build the exe, and publish the release in one step
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v1.1.2)"
+        required: true
+        default: "v1.1.2"
+      release_notes:
+        description: "Release notes (markdown)"
+        required: false
+        default: |
+          # YukiCrypt
+
+          Security hardening and robustness improvements.
+
+          ## 📦 Install
+          Download `YukiCrypt.exe` below — no Python required — or run from source:
+
+              pip install PyQt6 cryptography argon2-cffi
+              python app.py
 
 permissions:
   contents: write
@@ -29,7 +52,20 @@ jobs:
           --icon NONE
           app.py
 
-      - name: Upload exe to release
+      # When triggered via workflow_dispatch, create the tag + release first,
+      # then attach the exe to it.
+      - name: Create tag and release (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: "YukiCrypt ${{ github.event.inputs.version }}"
+          body: ${{ github.event.inputs.release_notes }}
+          files: dist/YukiCrypt.exe
+
+      # When triggered by a published release, just attach the exe.
+      - name: Upload exe to existing release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/YukiCrypt.exe
