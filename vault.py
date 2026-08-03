@@ -148,6 +148,19 @@ def analyse_password(password: str) -> dict:
             "issues": issues, "entropy": round(entropy, 1)}
 
 
+def safe_output_path(base_dir: str, virtual_path: str) -> str:
+    """Resolve a vault path under base_dir and reject traversal."""
+    base_real = os.path.realpath(base_dir)
+    rel_path  = virtual_path.replace("\\", "/").replace("/", os.sep)
+    out_path  = os.path.realpath(os.path.join(base_real, rel_path))
+    try:
+        if os.path.commonpath([base_real, out_path]) != base_real:
+            raise VaultError("Stored path escapes the selected destination.")
+    except ValueError:
+        raise VaultError("Stored path escapes the selected destination.")
+    return out_path
+
+
 # ── Vault ────────────────────────────────────────────────────────────────────
 
 class Vault:
@@ -574,7 +587,7 @@ class Vault:
 
             try:
                 data     = self._aesgcm.decrypt(data_nonce, enc_data, vpath.encode())
-                out_path = os.path.join(output_dir, vpath.replace("/", os.sep))
+                out_path = safe_output_path(output_dir, vpath)
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 with open(out_path, "wb") as f:
                     f.write(data)
@@ -709,4 +722,23 @@ class Vault:
             log.warning(f"Checkpoint failed: {e}")
 
     def _normalize(self, path: str) -> str:
-        return path.replace("\\", "/").strip("/")
+        raw = path.replace("\\", "/")
+        if raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw):
+            raise VaultError("Vault paths must be relative.")
+
+        parts = []
+        for part in raw.split("/"):
+            if part == "":
+                continue
+            if part in (".", ".."):
+                raise VaultError("Vault paths cannot contain '.' or '..' segments.")
+            if "\x00" in part:
+                raise VaultError("Vault paths cannot contain NUL bytes.")
+            if not parts and re.match(r"^[A-Za-z]:$", part):
+                raise VaultError("Vault paths must be relative.")
+            parts.append(part)
+
+        normalized = "/".join(parts)
+        if not normalized:
+            raise VaultError("Vault path cannot be empty.")
+        return normalized
