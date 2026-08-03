@@ -16,6 +16,7 @@ Security design:
 
 import os
 import re
+import sys
 import time
 import math
 import ctypes
@@ -27,6 +28,28 @@ from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# ── Bytes object memory layout ──────────────────────────────────────────────
+# For "best-effort" wiping of key/password material from memory, we need the
+# byte offset where a bytes object's actual character data begins (after the
+# PyObject header). This is NOT a fixed constant across Python builds/versions
+# — computing it dynamically via sys.getsizeof(b"") is a reliable proxy:
+# an empty bytes object is exactly [header][1 null terminator byte], so
+# header size = sys.getsizeof(b"") - 1.
+_BYTES_DATA_OFFSET = sys.getsizeof(b"") - 1
+
+
+def _wipe_bytes(data: bytes):
+    """
+    Best-effort in-place zeroing of a bytes object's underlying memory.
+    Not a guaranteed secure wipe (Python may have made copies we can't
+    reach, and this relies on CPython's object layout), but far better
+    than leaving the secret's bytes untouched.
+    """
+    try:
+        ctypes.memset(id(data) + _BYTES_DATA_OFFSET, 0, len(data))
+    except Exception:
+        pass
 
 # ── Optional Argon2 (stronger KDF) ──────────────────────────────────────────
 try:
@@ -77,10 +100,7 @@ def _derive_key(password: str, salt: bytes) -> bytes:
         key = kdf.derive(pw_bytes)
 
     # Best-effort wipe of password bytes from CPython memory
-    try:
-        ctypes.memset(id(pw_bytes) + 20, 0, len(pw_bytes))
-    except Exception:
-        pass
+    _wipe_bytes(pw_bytes)
 
     return key
 
@@ -264,10 +284,7 @@ class Vault:
     def close(self):
         with self._lock:
             if self._key:
-                try:
-                    ctypes.memset(id(self._key) + 20, 0, len(self._key))
-                except Exception:
-                    pass
+                _wipe_bytes(self._key)
                 self._key    = None
                 self._aesgcm = None
             self._path_index.clear()
@@ -448,7 +465,9 @@ class Vault:
                 "SELECT COUNT(*), COALESCE(SUM(size),0) FROM files"
             ).fetchone()
             file_count, total_size = row
-            db_size = os.path.getsize(self._path) if self._path else 0
+            # True size includes the -wal file — recent writes live there
+            # until checkpointed, so the main file alone under-reports usage
+            db_size = self._true_disk_size(self._path) if self._path else 0
         return {
             "file_count": file_count,
             "total_size": total_size,
@@ -571,37 +590,73 @@ class Vault:
         Reclaim free space using VACUUM INTO.
         WAL mode prevents in-place VACUUM from shrinking the file, so we use
         VACUUM INTO to create a compact copy then atomically replace the original.
-        Returns (size_before, size_after) in bytes.
+        Checkpoints first so size comparisons are measured against true disk
+        usage (main file alone under-reports if data is still sitting in -wal).
+        Returns (size_before, size_after) in bytes — both TRUE disk usage.
         """
         with self._lock:
             if not self._path:
                 return 0, 0
 
-            size_before  = os.path.getsize(self._path)
-            tmp_path     = self._path + ".compact_tmp"
+            # Flush WAL into main file first so size_before is accurate —
+            # otherwise recent writes hiding in -wal make the vault look
+            # smaller than it really is, and we'd wrongly skip compacting.
+            self._checkpoint()
+            size_before = self._true_disk_size(self._path)
+            tmp_path    = self._path + ".compact_tmp"
+
+            def _reopen():
+                """Reconnect to self._path. Raises on failure — caller decides
+                what state to leave the Vault in if this fails."""
+                db = sqlite3.connect(self._path, check_same_thread=False)
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA synchronous=FULL")
+                return db
 
             try:
-                # VACUUM INTO works with WAL mode — creates compacted copy
-                self._db.execute(f'VACUUM INTO "{tmp_path}"')
+                self._db.execute("VACUUM INTO ?", (tmp_path,))
+                size_after = os.path.getsize(tmp_path)   # single file, no WAL
 
-                size_after = os.path.getsize(tmp_path)
-
-                # Only replace if we actually saved space
                 if size_after < size_before:
                     self._db.close()
-                    os.replace(tmp_path, self._path)
-                    # Re-open the compacted file
-                    self._db = sqlite3.connect(
-                        self._path, check_same_thread=False
-                    )
-                    self._db.execute("PRAGMA journal_mode=WAL")
-                    self._db.execute("PRAGMA synchronous=FULL")
+                    self._db = None   # explicit "no connection" until reopened
+
+                    try:
+                        os.replace(tmp_path, self._path)
+                    except Exception:
+                        # Replace failed (e.g. AV lock) — original file at
+                        # self._path is untouched, so reopen it to keep the
+                        # vault usable rather than leaving self._db closed.
+                        self._db = _reopen()
+                        raise
+
+                    # Remove any stale -wal/-shm from the old file — the
+                    # replaced file starts fresh with no pending WAL data
+                    for suffix in ("-wal", "-shm"):
+                        stale = self._path + suffix
+                        if os.path.exists(stale):
+                            try:
+                                os.remove(stale)
+                            except Exception:
+                                pass
+
+                    try:
+                        self._db = _reopen()
+                    except Exception:
+                        # The replaced file on disk is valid — only the live
+                        # connection failed to open. Leave the Vault cleanly
+                        # closed (self._db stays None) rather than holding a
+                        # dead connection that is_open() would call healthy.
+                        # Caller must Vault.open() again; the data itself
+                        # (already on disk) is intact.
+                        self._key    = None
+                        self._aesgcm = None
+                        raise
                 else:
                     os.remove(tmp_path)
                     size_after = size_before
 
             except Exception:
-                # Clean up temp file if anything went wrong
                 try:
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
@@ -618,16 +673,40 @@ class Vault:
         Unlike the SQLite backup API, VACUUM INTO copies only live data pages
         so the backup is already compact — free space from deleted files is
         not copied. Atomic: backup is either complete or not written at all.
-        Returns (original_size, backup_size) in bytes.
+        Returns (original_size, backup_size) in bytes — original_size is TRUE
+        disk usage (includes -wal file) so the "space saved" figure is accurate.
         """
         with self._lock:
-            original_size = os.path.getsize(self._path) if self._path else 0
-            self._db.execute(f'VACUUM INTO "{backup_path}"')
+            original_size = self._true_disk_size(self._path) if self._path else 0
+            self._db.execute("VACUUM INTO ?", (backup_path,))
             backup_size = os.path.getsize(backup_path)
         log.info(f"Backup created: {backup_path} ({backup_size:,} bytes)")
         return original_size, backup_size
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _true_disk_size(self, path: str) -> int:
+        """
+        Total bytes actually used on disk for this vault.
+        In WAL mode, recent writes live in a '-wal' sidecar file until
+        checkpointed — the main file alone can drastically under-report
+        real disk usage. Sum main + -wal + -shm to get the true figure.
+        """
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            p = path + suffix
+            if os.path.exists(p):
+                total += os.path.getsize(p)
+        return total
+
+    def _checkpoint(self):
+        """Flush WAL data into the main file and truncate the WAL file.
+        Call before measuring size so os.path.getsize(self._path) alone
+        is accurate — avoids the WAL-file-hides-the-data problem."""
+        try:
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as e:
+            log.warning(f"Checkpoint failed: {e}")
 
     def _normalize(self, path: str) -> str:
         return path.replace("\\", "/").strip("/")
